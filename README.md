@@ -215,4 +215,9 @@ bt.plot_equity_curve()     # -> 畫資金曲線 + 每日曝險圖
 - **等張數而非等金額**：每筆固定 1000 股，不同價位股票的實際曝險差異很大（例如 2330 一張約 60 萬、0050 一張約 4 萬）。若需等金額加權，請自行調整。
 - **Sharpe 報酬率分母**：以「當日名目曝險（進場價 × 股數之總和）」為分母計算每日報酬率。
 - `.env` 含個人 token，請務必加入 `.gitignore`，不要提交到 git。
-# Strategy-System
+
+## Author
+
+Yu-Hao Wei  
+National Chengchi University  
+Department of Computer Science
