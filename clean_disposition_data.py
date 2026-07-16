@@ -307,6 +307,30 @@ def main() -> None:
           .sort_index().to_string())
     funnel.append(("L5 只留 10/12 交易日", len(df), f"-{len(dropped_l5)}"))
 
+    # --- L6：只留已完成的事件（period_end 已實際交易過）-------------------
+    _section("L6：只留已完成事件（period_end 嚴格早於今天）")
+    before = len(df)
+    today = pd.Timestamp.today().normalize()
+
+    # 嚴格早於今天：今天的盤可能尚未收，當日收盤價還不是定案值
+    keep_mask = pd.to_datetime(df["period_end"]) < today
+    dropped_l6 = df[~keep_mask].copy()
+    df = df[keep_mask].copy()
+
+    print(f"今天：{today.date()}；只保留 period_end < {today.date()} 的事件")
+    print(f"過濾前 {before} 筆 -> 過濾後 {len(df)} 筆"
+          f"（排除 {len(dropped_l6)} 筆）")
+    print()
+    print("排除原因：period_end 尚未到期（處置仍在進行中，出場價不存在），")
+    print("或 period_end 正是今天（當日盤可能未收，收盤價尚未定案）。")
+    print("若不排除，樣本會隨每個交易日經過而悄悄變大，回測結果無法重現。")
+    if not dropped_l6.empty:
+        print()
+        print("被排除的 in-flight 事件：")
+        print(dropped_l6[["date", "stock_id", "stock_name", "period_start",
+                          "period_end"]].to_string(index=False))
+    funnel.append(("L6 只留已完成事件", len(df), f"-{len(dropped_l6)}"))
+
     # --- 輸出 -----------------------------------------------------------
     out_cols = list(raw.columns) + [
         "market", "condition_category", "matching_interval_minutes",

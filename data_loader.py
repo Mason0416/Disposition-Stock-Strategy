@@ -300,7 +300,46 @@ def fetch_disposition_events(start_date: str,
     return df.loc[mask].reset_index(drop=True)
 
 
-def fetch_trading_calendar(start_date: str, end_date: str) -> pd.DatetimeIndex:
+# 用來驗證交易日曆的參照股票（大型權值股，正常情況下每個交易日都有量）。
+# 若這些股票在某日全數無價，該日必為休市，而非個別停牌。
+_CALENDAR_REFERENCE_STOCKS = ("2330", "2317", "2454", "2412", "1301")
+
+
+def _find_phantom_trading_days(dates: pd.DatetimeIndex, start_date: str,
+                               end_date: str) -> pd.DatetimeIndex:
+    """找出交易日曆列為交易日、但實際上全市場沒有交易的日期。
+
+    FinMind 的 TaiwanStockTradingDate 已知會誤列休市日（例如
+    2026-07-10）。以多檔大型權值股的實際價格資料交叉驗證：
+    只有當所有參照股票在該日皆無資料時，才判定為日曆錯誤。
+
+    Args:
+        dates: 待驗證的交易日曆。
+        start_date: 起始日期，格式 "YYYY-MM-DD"。
+        end_date: 結束日期，格式 "YYYY-MM-DD"。
+
+    Returns:
+        應從日曆剔除的日期。
+    """
+    traded = None
+    for stock_id in _CALENDAR_REFERENCE_STOCKS:
+        try:
+            index = load_data(stock_id, start_date, end_date).index
+        except Exception:  # noqa: BLE001
+            continue
+        traded = index if traded is None else traded.union(index)
+
+    if traded is None or traded.empty:
+        print("[警告] 參照股票皆無法載入，跳過交易日曆驗證")
+        return pd.DatetimeIndex([])
+
+    # 參照股票資料涵蓋範圍之外的日期無從驗證，不予判定
+    in_range = dates[(dates >= traded.min()) & (dates <= traded.max())]
+    return in_range.difference(traded)
+
+
+def fetch_trading_calendar(start_date: str, end_date: str,
+                           validate: bool = True) -> pd.DatetimeIndex:
     """抓取 FinMind TaiwanStockTradingDate，取得真實台股交易日曆。
 
     使用專用的交易日資料集，已排除週末與國定假日，
@@ -322,13 +361,21 @@ def fetch_trading_calendar(start_date: str, end_date: str) -> pd.DatetimeIndex:
     if os.path.exists(_TRADING_DATE_CSV) and os.path.exists(_TRADING_DATE_META):
         with open(_TRADING_DATE_META, encoding="utf-8") as fh:
             meta = json.load(fh)
-        if (pd.Timestamp(meta["start_date"]) <= start
-                and pd.Timestamp(meta["end_date"]) >= end):
+        cached_start = pd.Timestamp(meta["start_date"])
+        cached_end = pd.Timestamp(meta["end_date"])
+        today = pd.Timestamp.today().normalize()
+
+        # 快取範圍若延伸到今天（含）之後，尾端必然還沒發生完，
+        # 不能當成完整資料重複使用，否則日曆會永遠停在首次抓取那天。
+        cache_usable = (cached_start <= start and cached_end >= end
+                        and cached_end < today)
+        if cache_usable:
             cached = pd.read_csv(_TRADING_DATE_CSV)
             dates = pd.DatetimeIndex(pd.to_datetime(cached["date"])).sort_values()
             print(f"[快取] 讀取 {_TRADING_DATE_CSV}"
                   f"（涵蓋 {meta['start_date']} ~ {meta['end_date']}）")
-            return dates[(dates >= start) & (dates <= end)]
+            dates = dates[(dates >= start) & (dates <= end)]
+            return _validated(dates, start_date, end_date, validate)
 
     print(f"[抓取] 交易日曆 {start_date} ~ {end_date}")
     loader = _get_loader()
@@ -351,7 +398,33 @@ def fetch_trading_calendar(start_date: str, end_date: str) -> pd.DatetimeIndex:
         json.dump({"start_date": start_date, "end_date": end_date}, fh)
 
     dates = pd.DatetimeIndex(df["date"])
-    return dates[(dates >= start) & (dates <= end)]
+    dates = dates[(dates >= start) & (dates <= end)]
+    return _validated(dates, start_date, end_date, validate)
+
+
+def _validated(dates: pd.DatetimeIndex, start_date: str, end_date: str,
+               validate: bool) -> pd.DatetimeIndex:
+    """以實際價格資料驗證交易日曆，剔除誤列的休市日。
+
+    Args:
+        dates: 待驗證的交易日曆。
+        start_date: 起始日期。
+        end_date: 結束日期。
+        validate: 為 False 時直接回傳原日曆，不做驗證。
+
+    Returns:
+        剔除幽靈交易日後的日曆。
+    """
+    if not validate or dates.empty:
+        return dates
+
+    phantom = _find_phantom_trading_days(dates, start_date, end_date)
+    if len(phantom):
+        listed = "、".join(d.strftime("%Y-%m-%d") for d in phantom)
+        print(f"[修正] 交易日曆剔除 {len(phantom)} 個幽靈交易日"
+              f"（全市場無交易資料）：{listed}")
+        dates = dates.difference(phantom)
+    return dates
 
 
 def fetch_stock_market_type() -> pd.DataFrame:
