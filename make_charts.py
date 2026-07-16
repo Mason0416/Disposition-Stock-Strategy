@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from data_loader import fetch_trading_calendar  # noqa: E402
 from event_backtest import (  # noqa: E402
+    BASELINE_CONFIG,
     CLEAN_CSV,
     SLIPPAGE_SCENARIOS,
     STOP_FILL_MODES,
@@ -108,6 +109,88 @@ def chart_entry_return_by_day(trades: pd.DataFrame) -> None:
     fig.savefig(path)
     plt.close(fig)
     print(f"  [輸出] {path}")
+
+
+def chart_entry_return_by_day_open(trades: pd.DataFrame) -> None:
+    """長條圖：開盤價進場（當日即檢查停損）各進場日的平均報酬率。
+
+    比照 entry_return_by_day.png 的風格加上 95% 信賴區間誤差棒，並以不同
+    顏色與標註標出 baseline 選定的進場日。輸出獨立檔案，不覆蓋收盤價版本。
+
+    Args:
+        trades: 開盤價進場的交易明細（entry_price_mode=open、
+            stop_from_entry_day=True）。
+    """
+    stats = trades.groupby("entry_day_index")["return_pct"].agg(
+        ["size", "mean", "std"]
+    )
+    mean = stats["mean"] * 100
+    ci95 = 1.96 * stats["std"] / stats["size"] ** 0.5 * 100
+
+    baseline_day = BASELINE_CONFIG["entry_day_index"]
+    colors = [SERIES_2 if i == baseline_day else MUTED for i in stats.index]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(stats.index, mean, color=colors, width=0.68,
+           yerr=ci95, capsize=3,
+           error_kw={"ecolor": TEXT_SECONDARY, "elinewidth": 1.2})
+    ax.axhline(0, color=TEXT_SECONDARY, linewidth=1)
+
+    for day, value, err in zip(stats.index, mean, ci95):
+        if value >= 0:
+            y, va = value + err + 0.08, "bottom"
+        else:
+            y, va = value - err - 0.08, "top"
+        ax.text(day, y, f"{value:.2f}", ha="center", va=va,
+                fontsize=9, color=TEXT_SECONDARY)
+
+    # baseline 進場日標註
+    base_mean = mean.loc[baseline_day]
+    base_err = ci95.loc[baseline_day]
+    ax.annotate("baseline（第 5 天）",
+                (baseline_day, base_mean + base_err),
+                xytext=(0, 34), textcoords="offset points", ha="center",
+                fontsize=10, color=SERIES_2, fontweight="bold",
+                arrowprops={"arrowstyle": "->", "color": SERIES_2,
+                            "linewidth": 1.4})
+
+    ax.set_xlabel("進場日（處置期間第幾個交易日）")
+    ax.set_ylabel("平均報酬率 %")
+    ax.set_title("進場時機對平均報酬率的影響（開盤價進場）", fontsize=14,
+                 pad=30, color=TEXT_PRIMARY, loc="left")
+    ax.text(0, 1.02,
+            "開盤價進場、進場當日即檢查停損｜誤差線為 95% 信賴區間"
+            "｜綠色為 baseline 選定的第 5 天",
+            transform=ax.transAxes, fontsize=9.5, color=TEXT_SECONDARY)
+    ax.set_xticks(list(stats.index))
+    _style(ax)
+    fig.tight_layout()
+    path = os.path.join(CHART_DIR, "entry_return_by_day_open.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  [輸出] {path}")
+
+
+def build_open_entry_trades() -> pd.DataFrame:
+    """以開盤價進場（當日即檢查停損）重跑全進場日掃描。
+
+    成本參數沿用現行預設：9% 動態停損、停損線成交、滑價 0.1%、
+    手續費 0.001425 x 0.2 折、稅 0.003。
+
+    Returns:
+        全 entry_day_index 的交易明細。
+    """
+    events = pd.read_csv(CLEAN_CSV, dtype={"stock_id": str})
+    for col in ["period_start", "period_end"]:
+        events[col] = pd.to_datetime(events[col])
+
+    calendar = fetch_trading_calendar("2019-12-01", "2026-08-31")
+    prices = load_prices(build_price_ranges(events, calendar))
+
+    return build_trade_level(events, prices, calendar,
+                             entry_price_mode="open",
+                             stop_from_entry_day=True,
+                             verbose=False)
 
 
 def chart_entry_winrate_stoprate(trades: pd.DataFrame) -> None:
@@ -282,8 +365,12 @@ def main() -> None:
     print("重跑滑價敏感度矩陣…")
     matrix = build_sensitivity_matrix()
 
+    print("重跑開盤價進場掃描…")
+    open_trades = build_open_entry_trades()
+
     print("繪圖：")
     chart_entry_return_by_day(trades)
+    chart_entry_return_by_day_open(open_trades)
     chart_entry_winrate_stoprate(trades)
     chart_slippage_sensitivity(matrix)
     chart_return_distribution(trades)
