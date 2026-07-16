@@ -2,9 +2,12 @@
 
 負責從 FinMind 抓取台股日線資料，或從本地 CSV 讀取，
 並統一輸出標準 OHLCV DataFrame。
+另提供處置股名單與上市/上櫃對照表的抓取與快取。
 """
 
+import json
 import os
+import time
 
 import pandas as pd
 from FinMind.data import DataLoader
@@ -164,3 +167,220 @@ def load_multiple(stock_ids: list, start_date: str,
         except Exception as exc:  # noqa: BLE001
             print(f"[警告] 載入 {stock_id} 失敗，已略過：{exc}")
     return data
+
+
+# --- 處置股名單 / 上市櫃對照表 -------------------------------------------
+
+# 處置股名單快取路徑；_META 記錄「已抓取的日期範圍」，
+# 因為處置事件是稀疏的，無法用資料本身的最早/最晚日期推斷涵蓋範圍。
+_DISPOSITION_CSV = os.path.join("data", "disposition_events.csv")
+_DISPOSITION_META = os.path.join("data", "disposition_events_range.json")
+_STOCK_INFO_CSV = os.path.join("data", "stock_info.csv")
+_TRADING_DATE_CSV = os.path.join("data", "trading_dates.csv")
+_TRADING_DATE_META = os.path.join("data", "trading_dates_range.json")
+
+# 分批抓取的區間長度與批次間延遲（秒），避免撞到 600 次/hr 流量上限
+_CHUNK_YEARS = 1
+_REQUEST_DELAY = 1.0
+
+
+def _get_loader() -> DataLoader:
+    """建立 FinMind DataLoader，若 .env 有 token 則登入。
+
+    Returns:
+        已（視情況）登入的 DataLoader。
+    """
+    loader = DataLoader()
+    token = os.getenv("FINMIND_TOKEN")
+    if token:
+        loader.login_by_token(api_token=token)
+    return loader
+
+
+def _date_chunks(start: pd.Timestamp, end: pd.Timestamp) -> list:
+    """將日期區間切成數個不重疊的子區間，用於分批打 API。
+
+    Args:
+        start: 起始日期。
+        end: 結束日期。
+
+    Returns:
+        list[tuple[str, str]]，每個元素為 (start_date, end_date) 字串。
+    """
+    chunks = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(
+            cursor + pd.DateOffset(years=_CHUNK_YEARS) - pd.Timedelta(days=1),
+            end,
+        )
+        chunks.append((cursor.strftime("%Y-%m-%d"),
+                       chunk_end.strftime("%Y-%m-%d")))
+        cursor = chunk_end + pd.Timedelta(days=1)
+    return chunks
+
+
+def fetch_disposition_events(start_date: str,
+                             end_date: str) -> pd.DataFrame:
+    """抓取 FinMind 公布處置有價證券表（處置股名單）。
+
+    使用 FinMind 套件內建的 taiwan_stock_disposition_securities_period
+    方法（不帶 stock_id 代表抓取全市場）。此為 Sponsor 付費限定資料集，
+    需在 .env 設定 FINMIND_TOKEN。
+
+    因區間可能長達數年，會以每 _CHUNK_YEARS 年為單位分批抓取，
+    批次之間加入短暫延遲。結果快取於 data/disposition_events.csv，
+    並以 sidecar JSON 記錄已抓取的日期範圍；若快取涵蓋指定期間，
+    則直接讀取不重打 API。
+
+    Args:
+        start_date: 起始日期，格式 "YYYY-MM-DD"。
+        end_date: 結束日期，格式 "YYYY-MM-DD"。
+
+    Returns:
+        處置事件 DataFrame，已裁切至指定日期範圍，依 date/stock_id 排序。
+        欄位以 FinMind 實際回傳為準，預期包含 date, stock_id, stock_name,
+        disposition_cnt, condition, measure, period_start, period_end。
+
+    Raises:
+        ValueError: 當所有批次皆回傳空資料時。
+    """
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+
+    # 快取涵蓋指定期間則直接讀取
+    if os.path.exists(_DISPOSITION_CSV) and os.path.exists(_DISPOSITION_META):
+        with open(_DISPOSITION_META, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        cached_start = pd.Timestamp(meta["start_date"])
+        cached_end = pd.Timestamp(meta["end_date"])
+
+        if cached_start <= start and cached_end >= end:
+            cached = pd.read_csv(_DISPOSITION_CSV, dtype={"stock_id": str})
+            cached["date"] = pd.to_datetime(cached["date"])
+            mask = (cached["date"] >= start) & (cached["date"] <= end)
+            print(f"[快取] 讀取 {_DISPOSITION_CSV}"
+                  f"（涵蓋 {meta['start_date']} ~ {meta['end_date']}）")
+            return cached.loc[mask].reset_index(drop=True)
+
+    loader = _get_loader()
+    chunks = _date_chunks(start, end)
+    frames = []
+
+    for idx, (chunk_start, chunk_end) in enumerate(chunks, 1):
+        print(f"[抓取] 處置股名單 {chunk_start} ~ {chunk_end} "
+              f"（{idx}/{len(chunks)}）")
+        raw = loader.taiwan_stock_disposition_securities_period(
+            start_date=chunk_start,
+            end_date=chunk_end,
+        )
+        if raw is not None and not raw.empty:
+            frames.append(raw)
+
+        if idx < len(chunks):
+            time.sleep(_REQUEST_DELAY)
+
+    if not frames:
+        raise ValueError(
+            f"FinMind 回傳空資料：處置股名單 {start_date} ~ {end_date}"
+        )
+
+    df = pd.concat(frames, ignore_index=True)
+    df["stock_id"] = df["stock_id"].astype(str)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.drop_duplicates()
+    df = df.sort_values(["date", "stock_id"]).reset_index(drop=True)
+
+    os.makedirs("data", exist_ok=True)
+    df.to_csv(_DISPOSITION_CSV, index=False)
+    with open(_DISPOSITION_META, "w", encoding="utf-8") as fh:
+        json.dump({"start_date": start_date, "end_date": end_date}, fh)
+
+    mask = (df["date"] >= start) & (df["date"] <= end)
+    return df.loc[mask].reset_index(drop=True)
+
+
+def fetch_trading_calendar(start_date: str, end_date: str) -> pd.DatetimeIndex:
+    """抓取 FinMind TaiwanStockTradingDate，取得真實台股交易日曆。
+
+    使用專用的交易日資料集，已排除週末與國定假日，
+    不需借用個股日K的日期 index 反推。結果快取於 data/trading_dates.csv。
+
+    Args:
+        start_date: 起始日期，格式 "YYYY-MM-DD"。
+        end_date: 結束日期，格式 "YYYY-MM-DD"。
+
+    Returns:
+        DatetimeIndex，已排序的交易日，裁切至指定範圍。
+
+    Raises:
+        ValueError: 當 FinMind 回傳空資料時。
+    """
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+
+    if os.path.exists(_TRADING_DATE_CSV) and os.path.exists(_TRADING_DATE_META):
+        with open(_TRADING_DATE_META, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        if (pd.Timestamp(meta["start_date"]) <= start
+                and pd.Timestamp(meta["end_date"]) >= end):
+            cached = pd.read_csv(_TRADING_DATE_CSV)
+            dates = pd.DatetimeIndex(pd.to_datetime(cached["date"])).sort_values()
+            print(f"[快取] 讀取 {_TRADING_DATE_CSV}"
+                  f"（涵蓋 {meta['start_date']} ~ {meta['end_date']}）")
+            return dates[(dates >= start) & (dates <= end)]
+
+    print(f"[抓取] 交易日曆 {start_date} ~ {end_date}")
+    loader = _get_loader()
+    df = loader.taiwan_stock_trading_date(
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    if df is None or df.empty:
+        raise ValueError(
+            f"FinMind 回傳空資料：交易日曆 {start_date} ~ {end_date}"
+        )
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.drop_duplicates(subset="date").sort_values("date")
+
+    os.makedirs("data", exist_ok=True)
+    df[["date"]].to_csv(_TRADING_DATE_CSV, index=False)
+    with open(_TRADING_DATE_META, "w", encoding="utf-8") as fh:
+        json.dump({"start_date": start_date, "end_date": end_date}, fh)
+
+    dates = pd.DatetimeIndex(df["date"])
+    return dates[(dates >= start) & (dates <= end)]
+
+
+def fetch_stock_market_type() -> pd.DataFrame:
+    """抓取 FinMind TaiwanStockInfo，取得 stock_id -> type 對照表。
+
+    TaiwanStockInfo 為免費資料集。結果快取於 data/stock_info.csv，
+    檔案存在時直接讀取。
+
+    Returns:
+        個股基本資料 DataFrame，欄位以 FinMind 實際回傳為準，
+        預期包含 stock_id, stock_name, type（上市/上櫃別）等。
+
+    Raises:
+        ValueError: 當 FinMind 回傳空資料時。
+    """
+    if os.path.exists(_STOCK_INFO_CSV):
+        print(f"[快取] 讀取 {_STOCK_INFO_CSV}")
+        return pd.read_csv(_STOCK_INFO_CSV, dtype={"stock_id": str})
+
+    print("[抓取] TaiwanStockInfo")
+    loader = _get_loader()
+    df = loader.taiwan_stock_info()
+
+    if df is None or df.empty:
+        raise ValueError("FinMind 回傳空資料：TaiwanStockInfo")
+
+    df["stock_id"] = df["stock_id"].astype(str)
+
+    os.makedirs("data", exist_ok=True)
+    df.to_csv(_STOCK_INFO_CSV, index=False)
+
+    return df
