@@ -199,11 +199,17 @@ def simulate_trade(ohlc: pd.DataFrame, period_days: pd.DatetimeIndex,
                    entry_pos: int, stop_loss_pct: float,
                    stop_fill_mode: str,
                    entry_price_mode: str = "close",
-                   stop_from_entry_day: bool = False) -> dict:
-    """模擬單筆做多交易，進場後逐日以動態停損線檢查盤中最低價。
+                   stop_from_entry_day: bool = False,
+                   stop_basis: str = "trailing_daily") -> dict:
+    """模擬單筆做多交易，進場後逐日檢查盤中最低價是否觸及停損線。
 
-    停損線每日重算：stop_line(t) = close(t-1) * (1 - stop_loss_pct)，
-    其中進場隔日的 close(t-1) 即進場日收盤價。當日 low 觸及停損線即出場；
+    停損線的計算方式由 stop_basis 決定：
+      "trailing_daily"（預設，維持既有 baseline 行為）：每日重算，
+          stop_line(t) = close(t-1) * (1 - stop_loss_pct)，進場隔日的
+          close(t-1) 即進場日收盤價。
+      "entry_fixed"：全程固定，stop_line = entry_price * (1 - stop_loss_pct)。
+
+    兩種基準下，觸發判斷（當日 low <= stop_line）與成交邏輯完全相同；
     一路未觸發則抱到 period_end 收盤。停牌（無資料）的日子跳過不檢查，
     亦不更新前一日收盤價。
 
@@ -217,6 +223,8 @@ def simulate_trade(ohlc: pd.DataFrame, period_days: pd.DatetimeIndex,
         stop_from_entry_day: 是否自進場日當天起就檢查停損。開盤價進場時
             當日盤中風險為真，設為 True 才反映實際；收盤價進場時當日
             已無盤中風險，應維持 False。
+        stop_basis: 停損線基準，"trailing_daily"（每日重算）或
+            "entry_fixed"（進場價固定），見上方說明。
 
     Returns:
         含 entry_price, exit_price, exit_date, exit_reason, gapped 的 dict；
@@ -229,7 +237,8 @@ def simulate_trade(ohlc: pd.DataFrame, period_days: pd.DatetimeIndex,
     if entry_price <= 0:
         return None
 
-    # 停損線一律以「前一交易日收盤價」為基準，與進場價取法無關
+    # trailing_daily 以「前一交易日收盤價」為基準（與進場價取法無關）；
+    # entry_fixed 全程固定為進場價乘上停損比例。
     check_days = period_days[entry_pos:] if stop_from_entry_day \
         else period_days[entry_pos + 1:]
 
@@ -243,11 +252,16 @@ def simulate_trade(ohlc: pd.DataFrame, period_days: pd.DatetimeIndex,
     else:
         prev_close = float(ohlc.loc[entry_date, "close"])
 
+    fixed_stop_line = entry_price * (1 - stop_loss_pct)
+
     for day in check_days:
         if day not in ohlc.index:
             continue
         row = ohlc.loc[day]
-        stop_line = prev_close * (1 - stop_loss_pct)
+        if stop_basis == "entry_fixed":
+            stop_line = fixed_stop_line
+        else:
+            stop_line = prev_close * (1 - stop_loss_pct)
 
         if float(row["low"]) <= stop_line:
             open_price = float(row["open"])
@@ -287,6 +301,7 @@ def build_trade_level(events: pd.DataFrame, prices: dict,
                       stop_fill_mode: str = "stop_line",
                       entry_price_mode: str = "close",
                       stop_from_entry_day: bool = False,
+                      stop_basis: str = "trailing_daily",
                       verbose: bool = True) -> pd.DataFrame:
     """建立「事件 x 進場日」的交易明細。
 
@@ -302,6 +317,9 @@ def build_trade_level(events: pd.DataFrame, prices: dict,
         slippage_pct: 滑價百分比。
         stop_loss_pct: 停損百分比。
         stop_fill_mode: 停損成交價模式。
+        entry_price_mode: 進場價取用 "close" 或 "open"。
+        stop_from_entry_day: 是否自進場日當天起就檢查停損。
+        stop_basis: 停損線基準，"trailing_daily" 或 "entry_fixed"。
         verbose: 是否印出略過統計。
 
     Returns:
@@ -333,7 +351,8 @@ def build_trade_level(events: pd.DataFrame, prices: dict,
         for idx in range(1, n):
             trade = simulate_trade(ohlc, period_days, idx - 1,
                                    stop_loss_pct, stop_fill_mode,
-                                   entry_price_mode, stop_from_entry_day)
+                                   entry_price_mode, stop_from_entry_day,
+                                   stop_basis)
             if trade is None:
                 skipped_no_price += 1
                 continue
@@ -584,6 +603,56 @@ def compare_entry_price_mode(events: pd.DataFrame, prices: dict,
     return pd.DataFrame(rows)
 
 
+def compare_stop_basis(events: pd.DataFrame, prices: dict,
+                       calendar: pd.DatetimeIndex) -> pd.DataFrame:
+    """比較兩種停損線基準：每日重算 vs 進場價固定。
+
+    除 stop_basis 外，所有參數一律沿用 BASELINE_CONFIG（第 5 天開盤價進場、
+    進場當日即檢查停損、9% 停損、其餘成本不變），以隔離停損基準的效果。
+
+    Args:
+        events: 處置事件 DataFrame。
+        prices: load_prices 產生的日K字典。
+        calendar: 交易日曆。
+
+    Returns:
+        並排比較表。
+    """
+    cfg = BASELINE_CONFIG
+    variants = [
+        ("trailing_daily（每日重算，baseline）", "trailing_daily"),
+        ("entry_fixed（進場價固定）", "entry_fixed"),
+    ]
+
+    rows = []
+    for label, basis in variants:
+        trades = build_trade_level(
+            events, prices, calendar,
+            slippage_pct=cfg["slippage_pct"],
+            stop_loss_pct=cfg["stop_loss_pct"],
+            stop_fill_mode=cfg["stop_fill_mode"],
+            entry_price_mode=cfg["entry_price_mode"],
+            stop_from_entry_day=cfg["stop_from_entry_day"],
+            stop_basis=basis,
+            verbose=False,
+        )
+        trades = trades[trades["entry_day_index"] == cfg["entry_day_index"]]
+        ret = trades["return_pct"]
+        stopped = trades["exit_reason"] == "stop_loss"
+        rows.append({
+            "停損基準": label,
+            "樣本數": len(trades),
+            "勝率%": round((ret > 0).mean() * 100, 1),
+            "停損觸發率%": round(stopped.mean() * 100, 1),
+            "平均%": round(ret.mean() * 100, 2),
+            "中位數%": round(ret.median() * 100, 2),
+            "平均持有天數": round(trades["holding_days"].mean(), 2),
+            "平均pnl_ntd": round(trades["pnl_ntd"].mean()),
+            "總pnl_ntd": round(trades["pnl_ntd"].sum()),
+        })
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     """執行事件回測與停損模擬。"""
     load_dotenv()
@@ -637,6 +706,10 @@ def main() -> None:
 
     _section("進場價假設：開盤價 vs 收盤價（entry_day_index=4）")
     print(compare_entry_price_mode(events, prices, calendar).to_string(index=False))
+
+    _section("停損基準：每日重算 vs 進場價固定"
+             f"（entry_day_index={BASELINE_CONFIG['entry_day_index']}、開盤進場）")
+    print(compare_stop_basis(events, prices, calendar).to_string(index=False))
 
     _section(f"以下為掃描／敏感度測試（非 baseline）"
              f"｜基準情境（動態 {STOP_LOSS_PCT:.0%} 停損、low 觸發、"
