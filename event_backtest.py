@@ -614,18 +614,27 @@ def run_baseline_no_stoploss(events: pd.DataFrame, prices: dict,
     return trades, summary
 
 
+# 三組名稱（皆可執行、無 look-ahead bias）。第一組不再依「未來是否升級」
+# 篩選，因為下單當下無法得知這次第一次處置未來會不會升級。
+GROUP_FIRST = "第一次處置"        # 全部第一次（不分未來是否升級）
+GROUP_ESCALATED = "接續升級20分"   # 第二次以上，緊接自己前一次第一次（重疊）
+GROUP_INDEPENDENT = "獨立20分"     # 第二次以上，獨立發生
+GROUP_ORDER = [GROUP_FIRST, GROUP_ESCALATED, GROUP_INDEPENDENT]
+
+
 def assign_escalation_groups(events: pd.DataFrame,
                              calendar: pd.DatetimeIndex) -> pd.Series:
-    """依 disposition_order 與嚴格重疊，將事件分為三組。
-
-    以 disposition_order 判斷第一次（≈5分）/第二次以上（≈20分）；升級的
-    嚴格定義為：同股票相鄰事件中，第一次(a)之後緊接第二次以上(b)，且
-    b 的 period_start 落在 [a.period_start, a.period_end] 內（真正中途插入）。
+    """依 disposition_order 將事件分為三組（皆可執行、無 look-ahead）。
 
     分組（每筆恰屬一組，涵蓋全部事件）：
-      純5分   —— 第一次，且非任何升級對的前段
-      純20分  —— 第二次以上，且非任何升級對的後段
-      5分升20分 —— 升級對的前段第一次或後段第二次以上
+      第一次處置   —— disposition_order == 第一次（**全部**，不論未來是否升級；
+                     下單當下無法得知未來升級與否，故不以此篩選）
+      接續升級20分 —— 第二次以上，且緊接自己前一次第一次處置（嚴格重疊：
+                     本次 period_start 落在前次第一次的 [period_start, period_end]）
+      獨立20分     —— 第二次以上，且非接續前次第一次而來
+
+    第二、三組的區分只用歷史資訊（本次事件發生時，前次處置早已公告），
+    故可執行；第一組不做「是否升級」的未來篩選，同樣可執行。
 
     Args:
         events: 處置事件 DataFrame（需含 stock_id/period_start/period_end/
@@ -636,7 +645,6 @@ def assign_escalation_groups(events: pd.DataFrame,
         與 events 對齊（同 index）的分組 Series。
     """
     ev = events.copy()
-    ev["_esc_first"] = False
     ev["_esc_second"] = False
     order = ev.sort_values(["stock_id", "period_start"])
     for _, g in order.groupby("stock_id"):
@@ -646,20 +654,19 @@ def assign_escalation_groups(events: pd.DataFrame,
             if (a["disposition_order"] == "第一次"
                     and b["disposition_order"] == "第二次以上"
                     and a["period_start"] <= b["period_start"] <= a["period_end"]):
-                ev.at[ia, "_esc_first"] = True
                 ev.at[ib, "_esc_second"] = True
 
     def _grp(r):
-        if r["_esc_first"] or r["_esc_second"]:
-            return "5分升20分"
-        return "純5分" if r["disposition_order"] == "第一次" else "純20分"
+        if r["disposition_order"] == "第一次":
+            return GROUP_FIRST
+        return GROUP_ESCALATED if r["_esc_second"] else GROUP_INDEPENDENT
 
     return ev.apply(_grp, axis=1)
 
 
 def three_group_performance(events: pd.DataFrame, prices: dict,
                             calendar: pd.DatetimeIndex) -> pd.DataFrame:
-    """以現行 baseline（無停損）計算純5分/純20分/5分升20分三組績效。
+    """以現行 baseline（無停損）計算三組（第一次／接續升級／獨立20分）績效。
 
     Args:
         events: 處置事件 DataFrame。
@@ -676,7 +683,7 @@ def three_group_performance(events: pd.DataFrame, prices: dict,
                           on=["stock_id", "period_start"], how="left")
 
     rows = []
-    for grp in ["純5分", "純20分", "5分升20分"]:
+    for grp in GROUP_ORDER:
         g = trades[trades["group"] == grp]
         ret = g["return_pct"]
         rows.append({
