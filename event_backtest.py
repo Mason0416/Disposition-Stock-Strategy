@@ -10,6 +10,8 @@
     python event_backtest.py
 """
 
+import glob
+
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -662,6 +664,123 @@ def assign_escalation_groups(events: pd.DataFrame,
         return GROUP_ESCALATED if r["_esc_second"] else GROUP_INDEPENDENT
 
     return ev.apply(_grp, axis=1)
+
+
+# --- 處置事件對應注意款號（1~8）標記 -------------------------------------
+
+CLAUSE_CSV = "data/disposition_events_with_clauses.csv"
+
+# 各 condition_category 的回溯窗口（交易日數）。連續三日依規定只可能是第一款，
+# 直接標 {1}，不需 join 注意股。其餘三類以窗口內出現過的注意款號為準。
+_CLAUSE_WINDOW = {"連續五日": 5, "十日六次": 10, "三十日十二次": 30}
+_CLAUSE_RANGE = range(1, 9)   # 只看第 1~8 款
+
+
+def _load_attention_by_market() -> dict:
+    """載入各市場全年份注意股資料，回傳 {market: DataFrame}。"""
+    out = {}
+    for market in ("twse", "tpex"):
+        files = sorted(glob.glob(
+            f"data/attention_events_{market}_20*.csv"))
+        frames = [pd.read_csv(f, dtype={"stock_id": str}) for f in files]
+        df = pd.concat(frames, ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"])
+        out[market] = df
+    return out
+
+
+def tag_disposition_clauses(events: pd.DataFrame,
+                            calendar: pd.DatetimeIndex) -> pd.DataFrame:
+    """為每筆處置事件標記觸發的注意款號集合（第 1~8 款）。
+
+    無 look-ahead：處置事件公告時，回溯窗口內的注意股紀錄早已發生，屬於
+    事件當下即可得知的歷史資訊。規則：
+      - condition_category == 連續三日 → 直接標 {1}（依規定只可能第一款）。
+      - 其餘三類（連續五日/十日六次/三十日十二次）→ 以 stock_id+market join
+        對應注意股資料，在該類的回溯窗口（5/10/30 個交易日、以事件 date 為
+        最後一日）內，統計 {market}_attention_1~8 出現過哪些款（出現過就算，
+        不論天數）。
+      - 窗口內查無對應注意紀錄 → clause_missing=True，clause_set 為空。
+
+    Args:
+        events: 處置事件 DataFrame（需含 market/stock_id/date/
+            condition_category）。
+        calendar: 交易日曆。
+
+    Returns:
+        events 複本，新增 clause_1..clause_8（bool）、clause_set（排序後字串，
+        如 "2,6"）、clause_missing（bool）欄位。
+    """
+    att = _load_attention_by_market()
+    cal = pd.DatetimeIndex(sorted(calendar))
+
+    ev = events.copy()
+    ev["date"] = pd.to_datetime(ev["date"])
+
+    clause_sets = []
+    missing = []
+    for _, r in ev.iterrows():
+        cat = r["condition_category"]
+        if cat == "連續三日":
+            clause_sets.append({1})
+            missing.append(False)
+            continue
+
+        n = _CLAUSE_WINDOW.get(cat)
+        if n is None:                       # 非預期分類，保守標缺失
+            clause_sets.append(set())
+            missing.append(True)
+            continue
+
+        market, sid, d = r["market"], r["stock_id"], r["date"]
+        pos = cal.searchsorted(d, side="right") - 1
+        win_start = cal[max(0, pos - n + 1)]
+
+        a = att.get(market)
+        rows = a[(a["stock_id"] == sid) & (a["date"] >= win_start)
+                 & (a["date"] <= d)]
+        if rows.empty:
+            clause_sets.append(set())
+            missing.append(True)
+            continue
+
+        found = set()
+        for c in _CLAUSE_RANGE:
+            col = f"{market}_attention_{c}"
+            if col in rows.columns and rows[col].any():
+                found.add(c)
+        clause_sets.append(found)
+        missing.append(False)
+
+    for c in _CLAUSE_RANGE:
+        ev[f"clause_{c}"] = [c in s for s in clause_sets]
+    ev["clause_set"] = [",".join(str(c) for c in sorted(s)) for s in clause_sets]
+    ev["clause_missing"] = missing
+    return ev
+
+
+def build_clause_dataset(clean_csv: str = CLEAN_CSV,
+                         out_csv: str = CLAUSE_CSV) -> pd.DataFrame:
+    """讀取 clean.csv、標記款號、輸出 disposition_events_with_clauses.csv。
+
+    可重複執行：每次重跑都由 clean.csv 與注意股資料重新產生。
+
+    Args:
+        clean_csv: 清理後處置事件 CSV 路徑。
+        out_csv: 輸出路徑。
+
+    Returns:
+        含款號標記的 DataFrame。
+    """
+    events = pd.read_csv(clean_csv, dtype={"stock_id": str})
+    for col in ["date", "period_start", "period_end"]:
+        events[col] = pd.to_datetime(events[col])
+    calendar = fetch_trading_calendar("2019-12-01", "2026-08-31")
+    tagged = tag_disposition_clauses(events, calendar)
+    tagged.to_csv(out_csv, index=False)
+    print(f"[輸出] {out_csv}（{len(tagged)} 筆，"
+          f"缺失 {int(tagged['clause_missing'].sum())} 筆）")
+    return tagged
 
 
 def three_group_performance(events: pd.DataFrame, prices: dict,
