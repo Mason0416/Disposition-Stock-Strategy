@@ -237,6 +237,17 @@ def simulate_trade(ohlc: pd.DataFrame, period_days: pd.DatetimeIndex,
     if entry_price <= 0:
         return None
 
+    # stop_loss_pct 為 None：完全不套用停損，直接持有到 period_end。
+    if stop_loss_pct is None:
+        exit_date = period_days[-1]
+        return {
+            "entry_price": entry_price,
+            "exit_price": float(ohlc.loc[exit_date, "close"]),
+            "exit_date": exit_date,
+            "exit_reason": "period_end",
+            "gapped": False,
+        }
+
     # trailing_daily 以「前一交易日收盤價」為基準（與進場價取法無關）；
     # entry_fixed 全程固定為進場價乘上停損比例。
     check_days = period_days[entry_pos:] if stop_from_entry_day \
@@ -548,6 +559,53 @@ def run_baseline(events: pd.DataFrame, prices: dict,
         "總pnl_ntd": round(trades["pnl_ntd"].sum()),
         "平均持有天數": round(trades["holding_days"].mean(), 2),
         "Sharpe Ratio": SHARPE_CAVEAT,
+    }
+    return trades, summary
+
+
+def run_baseline_no_stoploss(events: pd.DataFrame, prices: dict,
+                             calendar: pd.DatetimeIndex) -> tuple:
+    """對照組：沿用 baseline 進場設定但完全不停損，純持有到 period_end。
+
+    進場設定與 BASELINE_CONFIG 相同（entry_day_index=5、開盤價進場），
+    成本參數不變，唯獨關閉停損——以 stop_loss_pct=1.0 使停損線為 0、
+    永不觸發，等同不設停損、抱到 period_end 收盤。不修改 BASELINE_CONFIG
+    或 run_baseline()，這是獨立的比較函式。
+
+    Args:
+        events: 處置事件 DataFrame。
+        prices: load_prices 產生的日K字典。
+        calendar: 交易日曆。
+
+    Returns:
+        (trades, summary) — 交易明細 DataFrame 與績效摘要 dict。
+    """
+    cfg = BASELINE_CONFIG
+    all_trades = build_trade_level(
+        events, prices, calendar,
+        slippage_pct=cfg["slippage_pct"],
+        stop_loss_pct=None,                # None = 完全不套用停損
+        stop_fill_mode=cfg["stop_fill_mode"],
+        entry_price_mode=cfg["entry_price_mode"],
+        stop_from_entry_day=cfg["stop_from_entry_day"],
+        verbose=False,
+    )
+    trades = all_trades[
+        all_trades["entry_day_index"] == cfg["entry_day_index"]
+    ].copy()
+
+    ret = trades["return_pct"]
+    n_stop = int((trades["exit_reason"] == "stop_loss").sum())
+    summary = {
+        "樣本數": len(trades),
+        "勝率%": round((ret > 0).mean() * 100, 1),
+        "停損觸發次數（應為0）": n_stop,
+        "平均報酬率%": round(ret.mean() * 100, 2),
+        "中位數報酬率%": round(ret.median() * 100, 2),
+        "報酬率標準差%": round(ret.std() * 100, 2),
+        "平均pnl_ntd": round(trades["pnl_ntd"].mean()),
+        "總pnl_ntd": round(trades["pnl_ntd"].sum()),
+        "平均持有天數": round(trades["holding_days"].mean(), 2),
     }
     return trades, summary
 
