@@ -28,6 +28,7 @@ from event_backtest import (  # noqa: E402
     build_trade_level,
     load_prices,
     scenario_stats,
+    three_group_performance,
 )
 
 CHART_DIR = "charts"
@@ -38,6 +39,7 @@ TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 SERIES_1 = "#2a78d6"   # 藍
 SERIES_2 = "#008300"   # 綠
+SERIES_3 = "#eb6834"   # 橘
 MUTED = "#a3a29c"      # 去強調用灰
 GRID = "#e3e2dd"
 
@@ -169,6 +171,158 @@ def chart_entry_return_by_day_open(trades: pd.DataFrame) -> None:
     fig.savefig(path)
     plt.close(fig)
     print(f"  [輸出] {path}")
+
+
+def chart_three_group_escalation() -> None:
+    """長條圖：純5分／純20分／5分升20分三組的平均報酬率（no-stop baseline）。
+
+    比照 entry_return_by_day_open.png 風格，含 95% 信賴區間誤差棒與樣本數標註。
+    """
+    events = pd.read_csv(CLEAN_CSV, dtype={"stock_id": str})
+    for col in ["period_start", "period_end"]:
+        events[col] = pd.to_datetime(events[col])
+    calendar = fetch_trading_calendar("2019-12-01", "2026-08-31")
+    prices = load_prices(build_price_ranges(events, calendar))
+    perf = three_group_performance(events, prices, calendar)
+
+    labels = ["純5分\n(第一次)", "純20分\n(第二次以上)", "5分升20分\n(中途升級)"]
+    x = range(len(perf))
+    mean = perf["mean"].values
+    ci95 = 1.96 * perf["se"].values
+    # 純5分去強調（最弱），另兩組同色（表現相近）
+    colors = [MUTED, SERIES_1, SERIES_1]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x, mean, color=colors, width=0.6, yerr=ci95, capsize=4,
+           error_kw={"ecolor": TEXT_SECONDARY, "elinewidth": 1.2})
+    ax.axhline(0, color=TEXT_SECONDARY, linewidth=1)
+
+    for xi, m, err, n in zip(x, mean, ci95, perf["n"]):
+        ax.text(xi, m + err + 0.12, f"{m:.2f}%", ha="center", va="bottom",
+                fontsize=11, color=TEXT_PRIMARY, fontweight="bold")
+        ax.text(xi, -0.30, f"n={n:,}", ha="center", va="top",
+                fontsize=9.5, color=TEXT_SECONDARY)
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, fontsize=10.5)
+    ax.set_ylabel("平均報酬率 %")
+    ax.set_title("處置升級三組的做多績效（無停損）", fontsize=14, pad=30,
+                 color=TEXT_PRIMARY, loc="left")
+    ax.text(0, 1.02,
+            "誤差線為 95% 信賴區間｜純5分明顯偏弱，純20分與升級組表現相近",
+            transform=ax.transAxes, fontsize=9.5, color=TEXT_SECONDARY)
+    ax.set_ylim(bottom=-0.6)
+    _style(ax)
+    fig.tight_layout()
+    path = os.path.join(CHART_DIR, "three_group_escalation.png")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  [輸出] {path}")
+
+
+def _draw_group_by_day(tbl: pd.DataFrame, group: str, color: str,
+                       filename: str) -> int:
+    """畫單一組的進場日1~11報酬長條圖（含95%CI、樣本數、最佳進場日標註）。
+
+    Args:
+        tbl: 含 group/day/n/mean/ci 的彙整表。
+        group: 組名。
+        color: 該組主色。
+        filename: 輸出檔名。
+
+    Returns:
+        該組最佳進場日（僅計 n>=20 的格子）。
+    """
+    sub = tbl[tbl["group"] == group].sort_values("day")
+    days = sub["day"].tolist()
+    mean = sub["mean"].fillna(0).values
+    ci = sub["ci"].fillna(0).values
+    ns = sub["n"].values
+    # 最佳進場日只在 n>=20 的格子裡選
+    elig = sub[(sub["n"] >= 20) & (sub["mean"].notna())]
+    best_day = int(elig.loc[elig["mean"].idxmax(), "day"])
+    best_mean = float(elig["mean"].max())
+    colors = [color if d == best_day else MUTED for d in days]
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(days, mean, color=colors, width=0.68, yerr=ci, capsize=3,
+           error_kw={"ecolor": TEXT_SECONDARY, "elinewidth": 1.1})
+    ax.axhline(0, color=TEXT_SECONDARY, linewidth=1)
+
+    for d, m, e, n in zip(days, mean, ci, ns):
+        ax.text(d, m + e + 0.12, f"{m:.2f}", ha="center", va="bottom",
+                fontsize=8.5, color=TEXT_SECONDARY)
+        label = f"({n})" if n < 20 else f"{n}"
+        ax.text(d, ax.get_ylim()[0], label, ha="center", va="top",
+                fontsize=7.5, color=TEXT_SECONDARY)
+
+    ax.annotate(f"最佳：第 {best_day} 天 {best_mean:.2f}%",
+                (best_day, best_mean + ci[days.index(best_day)]),
+                xytext=(0, 30), textcoords="offset points", ha="center",
+                fontsize=10.5, color=color, fontweight="bold",
+                arrowprops={"arrowstyle": "->", "color": color,
+                            "linewidth": 1.4})
+
+    ax.set_xticks(days)
+    ax.set_xlabel("進場日（處置期間第幾個交易日）")
+    ax.set_ylabel("平均報酬率 %")
+    ax.set_title(f"{group}：進場時機對報酬的影響（無停損、開盤進場）",
+                 fontsize=14, pad=30, color=TEXT_PRIMARY, loc="left")
+    ax.text(0, 1.02,
+            "誤差線為 95% 信賴區間｜柱下為樣本數（括號 = <20，不可靠）",
+            transform=ax.transAxes, fontsize=9.5, color=TEXT_SECONDARY)
+    y0 = ax.get_ylim()[0]
+    ax.set_ylim(bottom=y0 - (ax.get_ylim()[1] - y0) * 0.08)
+    _style(ax)
+    fig.tight_layout()
+    path = os.path.join(CHART_DIR, filename)
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"  [輸出] {path}  (最佳第 {best_day} 天 {best_mean:.2f}%)")
+    return best_day
+
+
+def chart_entry_return_by_day_by_group() -> pd.DataFrame:
+    """三組各自一張進場日1~11報酬圖（no-stop、開盤進場）。
+
+    輸出三個獨立檔案；不再疊在一起。
+
+    Returns:
+        三組 x 進場日 的彙整表（group/day/n/mean/ci）。
+    """
+    from event_backtest import assign_escalation_groups
+
+    events = pd.read_csv(CLEAN_CSV, dtype={"stock_id": str})
+    for col in ["date", "period_start", "period_end"]:
+        events[col] = pd.to_datetime(events[col])
+    calendar = fetch_trading_calendar("2019-12-01", "2026-08-31")
+    prices = load_prices(build_price_ranges(events, calendar))
+    events["group"] = assign_escalation_groups(events, calendar)
+
+    trades = build_trade_level(events, prices, calendar,
+                               entry_price_mode="open", stop_loss_pct=None,
+                               verbose=False)
+    trades = trades.merge(events[["stock_id", "period_start", "group"]],
+                          on=["stock_id", "period_start"], how="left")
+
+    rows = []
+    for g in ["純5分", "純20分", "5分升20分"]:
+        for d in range(1, 12):
+            sub = trades[(trades["group"] == g) &
+                         (trades["entry_day_index"] == d)]
+            n = len(sub)
+            ret = sub["return_pct"]
+            mean = round(ret.mean() * 100, 2) if n else None
+            ci = round(1.96 * ret.std() / n ** 0.5 * 100, 2) if n > 1 else None
+            rows.append({"group": g, "day": d, "n": n, "mean": mean, "ci": ci})
+    tbl = pd.DataFrame(rows)
+
+    specs = [("純5分", MUTED, "entry_return_by_day_pure5.png"),
+             ("純20分", SERIES_1, "entry_return_by_day_pure20.png"),
+             ("5分升20分", SERIES_3, "entry_return_by_day_escalation.png")]
+    for group, color, fname in specs:
+        _draw_group_by_day(tbl, group, color, fname)
+    return tbl
 
 
 def build_open_entry_trades() -> pd.DataFrame:
@@ -374,6 +528,7 @@ def main() -> None:
     chart_entry_winrate_stoprate(trades)
     chart_slippage_sensitivity(matrix)
     chart_return_distribution(trades)
+    chart_three_group_escalation()
 
 
 if __name__ == "__main__":

@@ -68,13 +68,19 @@ BASELINE_CSV = "data/baseline_summary.csv"
 # 動能：早進場時「當天開盤價比前一天收盤貴」的懲罰最重（第 1 天 -0.98pp、
 # 第 2 天 -0.89pp），越晚該懲罰越小甚至轉為紅利，因而把最佳點往後推。
 # 本 baseline 採開盤價進場，故取第 5 天。
+#
+# 注意四：本 baseline 已改為「無停損」（stop_loss_pct=None，持有至 period_end
+# 收盤）。原 9% 動態停損版本經配對檢定顯示會提早砍掉回檔的贏家，整體報酬
+# 反而較低（平均 2.10% vs 無停損 3.65%、中位數 0.24% vs 2.88%），代價僅是
+# 尾部風險較大。9% 停損版本的完整數字與分析移至 RESEARCH.md 保留。
+# stop_from_entry_day / stop_fill_mode 在無停損下不生效，保留僅為相容。
 # =========================================================================
 BASELINE_CONFIG = {
     "entry_day_index": 5,
     "entry_price_mode": "open",
-    "stop_from_entry_day": True,
-    "stop_loss_pct": 0.09,
-    "stop_fill_mode": "stop_line",
+    "stop_loss_pct": None,             # None = 無停損，持有至 period_end
+    "stop_from_entry_day": True,       # 無停損下不生效（保留相容）
+    "stop_fill_mode": "stop_line",     # 無停損下不生效（保留相容）
     "slippage_pct": 0.001,
     "fee_rate": FEE_RATE,
     "fee_discount": FEE_DISCOUNT,
@@ -545,13 +551,11 @@ def run_baseline(events: pd.DataFrame, prices: dict,
     ].copy()
 
     ret = trades["return_pct"]
-    stopped = trades["exit_reason"] == "stop_loss"
     summary = {
         "樣本數": len(trades),
         "樣本說明": SAMPLE_NOTE,
+        "停損機制": "無（持有至 period_end 收盤）",
         "勝率%": round((ret > 0).mean() * 100, 1),
-        "停損觸發率%": round(stopped.mean() * 100, 1),
-        "停損次數": int(stopped.sum()),
         "平均報酬率%": round(ret.mean() * 100, 2),
         "中位數報酬率%": round(ret.median() * 100, 2),
         "報酬率標準差%": round(ret.std() * 100, 2),
@@ -608,6 +612,83 @@ def run_baseline_no_stoploss(events: pd.DataFrame, prices: dict,
         "平均持有天數": round(trades["holding_days"].mean(), 2),
     }
     return trades, summary
+
+
+def assign_escalation_groups(events: pd.DataFrame,
+                             calendar: pd.DatetimeIndex) -> pd.Series:
+    """依 disposition_order 與嚴格重疊，將事件分為三組。
+
+    以 disposition_order 判斷第一次（≈5分）/第二次以上（≈20分）；升級的
+    嚴格定義為：同股票相鄰事件中，第一次(a)之後緊接第二次以上(b)，且
+    b 的 period_start 落在 [a.period_start, a.period_end] 內（真正中途插入）。
+
+    分組（每筆恰屬一組，涵蓋全部事件）：
+      純5分   —— 第一次，且非任何升級對的前段
+      純20分  —— 第二次以上，且非任何升級對的後段
+      5分升20分 —— 升級對的前段第一次或後段第二次以上
+
+    Args:
+        events: 處置事件 DataFrame（需含 stock_id/period_start/period_end/
+            disposition_order）。
+        calendar: 交易日曆（保留參數以利未來擴充，本函式未直接使用）。
+
+    Returns:
+        與 events 對齊（同 index）的分組 Series。
+    """
+    ev = events.copy()
+    ev["_esc_first"] = False
+    ev["_esc_second"] = False
+    order = ev.sort_values(["stock_id", "period_start"])
+    for _, g in order.groupby("stock_id"):
+        idx = g.index.tolist()
+        for ia, ib in zip(idx[:-1], idx[1:]):
+            a, b = ev.loc[ia], ev.loc[ib]
+            if (a["disposition_order"] == "第一次"
+                    and b["disposition_order"] == "第二次以上"
+                    and a["period_start"] <= b["period_start"] <= a["period_end"]):
+                ev.at[ia, "_esc_first"] = True
+                ev.at[ib, "_esc_second"] = True
+
+    def _grp(r):
+        if r["_esc_first"] or r["_esc_second"]:
+            return "5分升20分"
+        return "純5分" if r["disposition_order"] == "第一次" else "純20分"
+
+    return ev.apply(_grp, axis=1)
+
+
+def three_group_performance(events: pd.DataFrame, prices: dict,
+                            calendar: pd.DatetimeIndex) -> pd.DataFrame:
+    """以現行 baseline（無停損）計算純5分/純20分/5分升20分三組績效。
+
+    Args:
+        events: 處置事件 DataFrame。
+        prices: load_prices 產生的日K字典。
+        calendar: 交易日曆。
+
+    Returns:
+        每組一列，含 group/n/win/mean/median/mean_pnl/se 的 DataFrame。
+    """
+    ev = events.copy()
+    ev["group"] = assign_escalation_groups(ev, calendar)
+    trades, _ = run_baseline(ev, prices, calendar)
+    trades = trades.merge(ev[["stock_id", "period_start", "group"]],
+                          on=["stock_id", "period_start"], how="left")
+
+    rows = []
+    for grp in ["純5分", "純20分", "5分升20分"]:
+        g = trades[trades["group"] == grp]
+        ret = g["return_pct"]
+        rows.append({
+            "group": grp,
+            "n": len(g),
+            "win": round((ret > 0).mean() * 100, 1),
+            "mean": round(ret.mean() * 100, 2),
+            "median": round(ret.median() * 100, 2),
+            "mean_pnl": round(g["pnl_ntd"].mean()),
+            "se": ret.std() / len(g) ** 0.5 * 100,
+        })
+    return pd.DataFrame(rows)
 
 
 def compare_entry_price_mode(events: pd.DataFrame, prices: dict,
